@@ -887,7 +887,7 @@ def main():
         
         # Slope parameters
         st.subheader("Slope Parameters")
-        slope_window = st.slider("Slope Window (days)", 5, 30, 15)
+        slope_window = st.slider("Slope Length (days)", 5, 30, 15)
         pos_threshold = st.slider("Positive Threshold (%)", 0.0, 20.0, 5.0, 0.5)
         neg_threshold = st.slider("Negative Threshold (%)", -10.0, 10.0, 0.0, 0.5)
         
