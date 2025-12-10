@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -786,6 +787,173 @@ class SlopeTradingAnalyzer:
 
         return fig
 
+    def create_rsi_trigger_price_chart(self, ticker_df, branch_df, branch_name):
+        """
+        Gray candlestick price chart with ONLY dynamic RSI triggers based on branch definition.
+        Only RSI < threshold is used (as defined by LTxx in branch).
+        """
+
+        # --- Parse RSI settings ---
+        rsi_period, rsi_threshold = self.parse_rsi_from_branch(branch_name)
+
+        df = ticker_df.copy()
+        df = df.merge(branch_df[['Date', 'Active']], on='Date', how='left')
+        df = df.sort_values("Date")
+        df['Active'] = df['Active'].fillna(0)
+
+        # --- Compute RSI dynamically ---
+        df["RSI"] = self.compute_rsi(df["Close"], rsi_period)
+
+        # --- RSI triggers: ONLY LTxx ---
+        oversold = df[df["RSI"] < rsi_threshold]
+
+        # OPTIONAL ONLY if branch contains GTxx (rare)
+        if f"GT{rsi_threshold}" in branch_name:
+            overbought = df[df["RSI"] > rsi_threshold]
+        else:
+            overbought = pd.DataFrame()  # disable symmetric rule
+
+        # --- 1-year default window ---
+        max_date = df["Date"].max()
+        min_date = max_date - pd.DateOffset(years=1)
+
+        fig = go.Figure()
+
+        # --- Gray Candlesticks ---
+        fig.add_trace(
+            go.Candlestick(
+                x=df["Date"],
+                open=df["Open"],
+                high=df["High"],
+                low=df["Low"],
+                close=df["Close"],
+                increasing_line_color="gray",
+                decreasing_line_color="gray",
+                increasing_fillcolor="gray",
+                decreasing_fillcolor="gray",
+                name="Price",
+            )
+        )
+
+        # --- OVERSOLD markers (RSI < LTxx) ---
+        fig.add_trace(
+            go.Scatter(
+                x=oversold["Date"],
+                y=oversold["Close"],
+                mode="markers",
+                marker=dict(color="blue", size=12, symbol="triangle-up"),
+                name=f"RSI < {rsi_threshold}",
+            )
+        )
+
+        # --- OPTIONAL OVERBOUGHT markers only if defined in branch ---
+        if not overbought.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=overbought["Date"],
+                    y=overbought["Close"],
+                    mode="markers",
+                    marker=dict(color="red", size=12, symbol="triangle-down"),
+                    name=f"RSI > {rsi_threshold}",
+                )
+            )
+
+        # --- Layout ---
+        fig.update_layout(
+            template="plotly_white",
+            height=750,
+            margin=dict(l=60, r=40, t=60, b=60),
+            title=dict(
+                text=f"RSI Trigger Price Chart — Period {rsi_period}, LT Threshold {rsi_threshold}",
+                x=0.5,
+                font=dict(size=18),
+            ),
+            xaxis=dict(
+                range=[min_date, max_date],
+                rangeselector=dict(
+                    buttons=[
+                        dict(count=7, label="7D", step="day", stepmode="backward"),
+                        dict(count=1, label="1M", step="month", stepmode="backward"),
+                        dict(count=3, label="3M", step="month", stepmode="backward"),
+                        dict(count=6, label="6M", step="month", stepmode="backward"),
+                        dict(count=1, label="1Y", step="year", stepmode="backward"),
+                        dict(step="all", label="ALL"),
+                    ],
+                ),
+                rangeslider=dict(visible=True),
+                type="date",
+            ),
+            yaxis=dict(title="Price"),
+        )
+
+        return fig
+
+
+
+    def parse_rsi_from_branch(self, branch_name):
+        """
+        Extract RSI period and threshold from ANY branch name.
+
+        Examples it should handle:
+          - 15D_RSI_A_LT33
+          - 5d_RSI_AAON_LT26
+          - 14D_RSI_ADEA_LT37_and_200D_RSI_ADEA_LT50
+          - 15D_RSI_A_LT33_daily_trade_log
+
+        Returns:
+            (period, threshold)  e.g. (15, 33)
+        Uses the FIRST RSI block for the primary indicator.
+        """
+
+        # Strip possible suffixes like "_daily_trade_log"
+        base = branch_name.split("_daily_trade_log")[0]
+
+        # Regex: first block like "<digits>[dD]_RSI_<something>_(LT|GT)<digits>"
+        m = re.search(r"(\d+)[dD]_RSI_[^_]+_(LT|GT)(\d+)", base)
+        if m:
+            period = int(m.group(1))
+            threshold = int(m.group(3))
+            return period, threshold
+
+        # Fallback to your old token-based logic if regex fails
+        parts = base.split("_")
+        rsi_period = None
+        rsi_threshold = None
+
+        for part in parts:
+            # Detect "15D" or "15d"
+            if (part.endswith("D") or part.endswith("d")) and part[:-1].isdigit():
+                rsi_period = int(part[:-1])
+
+            # Detect thresholds like LT33 or GT20
+            if part.startswith("LT") and part[2:].isdigit():
+                rsi_threshold = int(part[2:])
+            if part.startswith("GT") and part[2:].isdigit():
+                rsi_threshold = int(part[2:])
+
+            if rsi_period is not None and rsi_threshold is not None:
+                break
+
+        # Safe fallbacks
+        if rsi_period is None:
+            rsi_period = 14
+        if rsi_threshold is None:
+            rsi_threshold = 30
+
+        return rsi_period, rsi_threshold
+
+
+    def compute_rsi(self, close_series, period):
+        delta = close_series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(period).mean()
+        avg_loss = loss.rolling(period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+
 
 
 # Initialize the analyzer
@@ -971,9 +1139,15 @@ def main():
                         )
                         st.plotly_chart(chart, use_container_width=True)
 
-                        st.subheader("RSI Trigger Chart (Gray Candles)")
-                        rsi_chart = analyzer.create_rsi_chart(ticker_data, branch_data)
+
+                        st.subheader("RSI Trigger Price Chart (Gray Candles)")
+                        rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(branch_to_analyze)
+                        st.caption(f"Debug RSI: period={rsi_period}, threshold={rsi_threshold}, branch={branch_to_analyze}")
+
+                        rsi_chart = analyzer.create_rsi_trigger_price_chart(ticker_data, branch_data, branch_to_analyze)
                         st.plotly_chart(rsi_chart, use_container_width=True)
+
+
 
                                         
                     # Trade details
