@@ -688,32 +688,35 @@ class SlopeTradingAnalyzer:
     # ───────────── RSI trigger price chart (dynamic) ─────────────
     def create_rsi_trigger_price_chart(self, ticker_df, branch_df, branch_name):
         """
-        Gray candlestick price chart with ONLY dynamic RSI triggers based on branch definition.
-        Only RSI < LTxx is used by default (as in branch name).
+        Fully TradingView-like price chart for RSI triggers.
+        Clean candles, volume bars, hover crosshair, TV-style period selectors.
         """
         rsi_period, rsi_threshold = self.parse_rsi_from_branch(branch_name)
 
         df = ticker_df.copy()
         df = df.merge(branch_df[["Date", "Active"]], on="Date", how="left")
-        df = df.sort_values("Date")
         df["Active"] = df["Active"].fillna(0)
-
         df["RSI"] = self.compute_rsi(df["Close"], rsi_period)
 
-        # Oversold: RSI < LTxx
+        # Time filter (last 1 year)
+        max_date = df["Date"].max()
+        df = df[df["Date"] >= max_date - pd.DateOffset(years=1)]
+
+        # TradingView candle colors
+        bull = "#26a69a"
+        bear = "#ef5350"
+
+        df["Volume_Color"] = [
+            bull if df["Close"].iloc[i] >= df["Open"].iloc[i] else bear
+            for i in range(len(df))
+        ]
+
         oversold = df[df["RSI"] < rsi_threshold]
 
-        # (Optional) overbought if explicitly encoded as GTxx
-        if f"GT{rsi_threshold}" in branch_name:
-            overbought = df[df["RSI"] > rsi_threshold]
-        else:
-            overbought = pd.DataFrame()
-
-        max_date = df["Date"].max()
-        min_date = max_date - pd.DateOffset(years=1)
-
+        # Figure
         fig = go.Figure()
 
+        # Candles
         fig.add_trace(
             go.Candlestick(
                 x=df["Date"],
@@ -721,63 +724,112 @@ class SlopeTradingAnalyzer:
                 high=df["High"],
                 low=df["Low"],
                 close=df["Close"],
-                increasing_line_color="gray",
-                decreasing_line_color="gray",
-                increasing_fillcolor="gray",
-                decreasing_fillcolor="gray",
+                increasing_line_color=bull,
+                decreasing_line_color=bear,
+                increasing_fillcolor=bull,
+                decreasing_fillcolor=bear,
                 name="Price",
             )
         )
 
+        # Volume bars
+        fig.add_trace(
+            go.Bar(
+                x=df["Date"],
+                y=df["Volume"],
+                marker_color=df["Volume_Color"],
+                opacity=0.35,
+                name="Volume",
+                yaxis="y2",
+            )
+        )
+
+        # RSI trigger markers
         fig.add_trace(
             go.Scatter(
                 x=oversold["Date"],
                 y=oversold["Close"],
                 mode="markers",
-                marker=dict(color="blue", size=12, symbol="triangle-up"),
                 name=f"RSI < {rsi_threshold}",
+                marker=dict(
+                    color="#1e88e5",
+                    size=12,
+                    symbol="triangle-up",
+                    line=dict(color="white", width=1),
+                ),
             )
         )
 
-        if not overbought.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=overbought["Date"],
-                    y=overbought["Close"],
-                    mode="markers",
-                    marker=dict(color="red", size=12, symbol="triangle-down"),
-                    name=f"RSI > {rsi_threshold}",
-                )
-            )
-
+        # Layout (TradingView style)
         fig.update_layout(
-            template="plotly_white",
-            height=750,
-            margin=dict(l=60, r=40, t=60, b=60),
             title=dict(
-                text=f"RSI Trigger Price Chart — Period {rsi_period}, LT Threshold {rsi_threshold}",
+                text=f"<b>{branch_name}</b> — RSI Trigger Chart",
                 x=0.5,
-                font=dict(size=18),
+                font=dict(size=20),
             ),
+            height=750,
+            margin=dict(l=60, r=40, t=60, b=40),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            hovermode="x unified",
+            showlegend=False,
             xaxis=dict(
-                range=[min_date, max_date],
+                type="date",
+                rangeslider=dict(visible=False),
+                showgrid=False,
                 rangeselector=dict(
                     buttons=[
                         dict(count=7, label="7D", step="day", stepmode="backward"),
                         dict(count=1, label="1M", step="month", stepmode="backward"),
                         dict(count=3, label="3M", step="month", stepmode="backward"),
                         dict(count=6, label="6M", step="month", stepmode="backward"),
+                        dict(step="year", stepmode="todate", label="YTD"),   # TradingView-style YTD
                         dict(count=1, label="1Y", step="year", stepmode="backward"),
                         dict(step="all", label="ALL"),
-                    ]
+                    ],
+                    bgcolor="rgba(255,255,255,0.8)",
+                    borderwidth=1,
+                    bordercolor="rgba(200,200,200,0.4)",
                 ),
-                rangeslider=dict(visible=True),
-                type="date",
             ),
-            yaxis=dict(title="Price"),
+            yaxis=dict(
+                title="Price",
+                showgrid=True,
+                gridcolor="rgba(200,200,200,0.25)",
+                zeroline=False,
+            ),
+            yaxis2=dict(
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                visible=False,
+                range=[0, df["Volume"].max() * 5],
+            ),
+        )
+
+        # Crosshair
+        fig.update_xaxes(
+            showspikes=True,
+            spikethickness=1,
+            spikecolor="#888",
+            spikedash="solid",
+            spikesnap="cursor",
+            showline=True,
+            linecolor="#ccc",
+        )
+        fig.update_yaxes(
+            showspikes=True,
+            spikethickness=1,
+            spikecolor="#888",
+            spikedash="solid",
+            spikesnap="cursor",
+            showline=True,
+            linecolor="#ccc",
         )
 
         return fig
+
+
 
     # ───────────── RSI helpers ─────────────
     def parse_rsi_from_branch(self, branch_name):
