@@ -137,7 +137,6 @@ st.markdown(
 # Cached I/O helpers (speed-up)
 # ─────────────────────────────
 
-
 @st.cache_data
 def cached_list_branches(trade_logs_path: str):
     csv_files = glob.glob(os.path.join(trade_logs_path, "*.csv"))
@@ -158,8 +157,9 @@ def cached_load_csv(path: str, date_col: str):
 
 
 # ─────────────────────────────
-# Core Analyzer
+# Core Analyzer (Single Strategy: RSI + Slope)
 # ─────────────────────────────
+
 class SlopeTradingAnalyzer:
     def __init__(self):
         self.trade_logs_path = "./trade_logs"
@@ -207,7 +207,7 @@ class SlopeTradingAnalyzer:
 
     # ───────────── Core calculations ─────────────
     def calculate_slope(self, prices: pd.Series, window: int) -> pd.Series:
-        """Calculate slope over a rolling window (kept same logic but slightly cleaned)."""
+        """Calculate slope over a rolling window as % change per window."""
         values = prices.values.astype(float)
         n = len(values)
         slopes = np.full(n, np.nan, dtype=float)
@@ -227,109 +227,155 @@ class SlopeTradingAnalyzer:
 
         return pd.Series(slopes, index=prices.index)
 
-    def apply_slope_filter(self, branch_data, ticker_data, slope_window, pos_threshold, neg_threshold):
+    # ───────────── RSI helpers ─────────────
+    def parse_rsi_from_branch(self, branch_name):
         """
-        Apply slope filtering with Flag-based trading logic.
-        Logic kept identical to your original version for correctness.
+        Extract RSI period and threshold from ANY branch name.
+        Examples:
+          - 15D_RSI_A_LT33
+          - 5d_RSI_AAON_LT26
+          - 14D_RSI_ADEA_LT37_and_200D_RSI_ADEA_LT50
+          - 15D_RSI_A_LT33_daily_trade_log
+        Returns: (period, threshold)
         """
-        merged = pd.merge(
-            branch_data,
-            ticker_data[["Date", "Close", "Volume"]],
-            on="Date",
-            how="left",
-        ).sort_values("Date")
+        base = branch_name.split("_daily_trade_log")[0]
 
-        merged["Slope"] = self.calculate_slope(merged["Close"], slope_window)
+        m = re.search(r"(\d+)[dD]_RSI_[^_]+_(LT|GT)(\d+)", base)
+        if m:
+            period = int(m.group(1))
+            threshold = int(m.group(3))
+            return period, threshold
 
-        merged["Flag"] = 0
-        merged["Entry_Signal"] = 0
-        merged["Exit_Signal"] = 0
-        merged["InTrade"] = 0
+        parts = base.split("_")
+        rsi_period = None
+        rsi_threshold = None
 
-        flag = 0
+        for part in parts:
+            if (part.endswith("D") or part.endswith("d")) and part[:-1].isdigit():
+                rsi_period = int(part[:-1])
+
+            if part.startswith("LT") and part[2:].isdigit():
+                rsi_threshold = int(part[2:])
+            if part.startswith("GT") and part[2:].isdigit():
+                rsi_threshold = int(part[2:])
+
+            if rsi_period is not None and rsi_threshold is not None:
+                break
+
+        if rsi_period is None:
+            rsi_period = 14
+        if rsi_threshold is None:
+            rsi_threshold = 30
+
+        return rsi_period, rsi_threshold
+
+    def compute_rsi(self, close_series: pd.Series, period: int):
+        delta = close_series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(period).mean()
+        avg_loss = loss.rolling(period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def compute_rsi_slope_trades(self, df, rsi_threshold):
+        """
+        Compute trades based on:
+        - RSI trigger
+        - Slope activation window
+        - Entry/exit rules:
+
+          1. When RSI < threshold:
+             - If slope is already active → enter immediately.
+             - Else → wait for the next slope activation and enter then.
+          2. Exit when slope deactivates (SlopeActive switches from True to False).
+          3. If RSI triggers but no slope activation happens → no trade.
+        """
+
+        trades = []
         in_position = False
+        waiting_for_slope = False
+        pending_rsi_trigger_date = None
+
         entry_price = None
         entry_date = None
 
-        signals = []
+        for i in range(1, len(df)):
+            row = df.iloc[i]
+            prev = df.iloc[i - 1]
 
-        for i in range(len(merged)):
-            row = merged.iloc[i]
+            rsi_trigger = row["RSI"] < rsi_threshold
+            slope_active = bool(row["SlopeActive"])
+            slope_just_activated = (not prev["SlopeActive"]) and slope_active
+            slope_just_deactivated = prev["SlopeActive"] and (not slope_active)
 
-            if pd.isna(row["Slope"]):
-                merged.at[merged.index[i], "Flag"] = flag
-                continue
+            # 1. RSI trigger occurs
+            if rsi_trigger:
+                pending_rsi_trigger_date = row["Date"]
 
-            # Flag logic: Flag turns to 1 when RSI gets activated
-            if row["Active"] == 1 and flag == 0:
-                flag = 1
+                # Case A: RSI triggers during slope-active → enter now
+                if slope_active:
+                    entry_price = row["Close"]
+                    entry_date = row["Date"]
+                    in_position = True
+                    waiting_for_slope = False
+                    continue
 
-            # Entry condition: Slope is positive (green) AND Flag is 1
-            if not in_position and flag == 1 and row["Slope"] > pos_threshold:
-                in_position = True
+                # Case B: RSI triggers while slope inactive → wait for next slope activation
+                waiting_for_slope = True
+
+            # 2. Waiting for slope activation after RSI → enter at first activation
+            if waiting_for_slope and slope_just_activated:
                 entry_price = row["Close"]
                 entry_date = row["Date"]
-                merged.at[merged.index[i], "Entry_Signal"] = 1
-                merged.at[merged.index[i], "InTrade"] = 1
+                in_position = True
+                waiting_for_slope = False
+                continue
 
-            elif in_position:
-                merged.at[merged.index[i], "InTrade"] = 1
+            # 3. In-position → check for exit on slope deactivation
+            if in_position and slope_just_deactivated:
+                exit_price = row["Close"]
+                exit_date = row["Date"]
 
-                # Exit condition: Slope is no longer green (falls below positive threshold)
-                if row["Slope"] <= pos_threshold:
-                    in_position = False
-                    exit_price = row["Close"]
-                    exit_date = row["Date"]
-                    merged.at[merged.index[i], "Exit_Signal"] = 1
-                    merged.at[merged.index[i], "InTrade"] = 0
+                trades.append(
+                    {
+                        "RSI_Trigger_Date": pending_rsi_trigger_date,
+                        "Entry_Date": entry_date,
+                        "Exit_Date": exit_date,
+                        "Entry_Price": entry_price,
+                        "Exit_Price": exit_price,
+                        "Return_Pct": (exit_price - entry_price) / entry_price * 100,
+                        "Days_Held": (exit_date - entry_date).days,
+                    }
+                )
 
-                    flag = 0
+                in_position = False
+                pending_rsi_trigger_date = None
 
-                    if entry_price and entry_price != 0:
-                        trade_return = (exit_price - entry_price) / entry_price * 100
-                        days_held = (exit_date - entry_date).days
-
-                        signals.append(
-                            {
-                                "Entry_Date": entry_date,
-                                "Exit_Date": exit_date,
-                                "Entry_Price": entry_price,
-                                "Exit_Price": exit_price,
-                                "Return_Pct": trade_return,
-                                "Days_Held": days_held,
-                            }
-                        )
-
-            merged.at[merged.index[i], "Flag"] = flag
-
-        signals_df = pd.DataFrame(signals)
-        if not signals_df.empty:
-            signals_df["Entry_Date"] = pd.to_datetime(signals_df["Entry_Date"])
-            signals_df["Exit_Date"] = pd.to_datetime(signals_df["Exit_Date"])
-
-        return merged, signals_df
+        return pd.DataFrame(trades)
 
     # ───────────── Metrics ─────────────
-    def calculate_performance_metrics(self, signals_df):
-        """Calculate comprehensive performance metrics."""
-        if signals_df.empty:
+    def calculate_performance_metrics(self, trades_df: pd.DataFrame):
+        """Calculate performance metrics from RSI+Slope trades."""
+        if trades_df is None or trades_df.empty:
             return {}
 
-        returns = signals_df["Return_Pct"].values
+        returns = trades_df["Return_Pct"].values
         num_trades = len(returns)
 
         total_return = float(np.sum(returns))
         win_rate = float(len(returns[returns > 0]) / num_trades * 100) if num_trades > 0 else 0.0
         avg_return = float(np.mean(returns)) if num_trades > 0 else 0.0
-        avg_days_held = float(signals_df["Days_Held"].mean()) if num_trades > 0 else 0.0
+        avg_days_held = float(trades_df["Days_Held"].mean()) if num_trades > 0 else 0.0
 
         max_drawdown = self.calculate_max_drawdown(returns)
         sharpe_ratio = self.calculate_sharpe_ratio(returns)
         volatility = float(np.std(returns)) if num_trades > 0 else 0.0
 
-        if not signals_df.empty:
-            total_days_in_market = float(signals_df["Days_Held"].sum())
-            date_range = (signals_df["Exit_Date"].max() - signals_df["Entry_Date"].min()).days
+        if not trades_df.empty:
+            total_days_in_market = float(trades_df["Days_Held"].sum())
+            date_range = (trades_df["Exit_Date"].max() - trades_df["Entry_Date"].min()).days
             time_in_market = float(total_days_in_market / date_range * 100) if date_range > 0 else 0.0
         else:
             time_in_market = 0.0
@@ -363,12 +409,12 @@ class SlopeTradingAnalyzer:
             / (np.std(returns) / 100.0)
         )
 
-    def compute_yearly_stats(self, signals_df):
-        """Compute per-year stats: Return, Max DD, Trades, Avg Hold."""
-        if signals_df.empty:
+    def compute_yearly_stats(self, trades_df: pd.DataFrame):
+        """Compute per-year stats: Return, Max DD, Trades, Avg Hold, based on Exit_Date."""
+        if trades_df is None or trades_df.empty:
             return {}
 
-        df = signals_df.copy()
+        df = trades_df.copy()
         df["Year"] = df["Exit_Date"].dt.year
 
         yearly = {}
@@ -392,300 +438,7 @@ class SlopeTradingAnalyzer:
 
         return yearly
 
-    # ───────────── Charts ─────────────
-    def create_price_chart(self, merged_data, signals_df, branch_name, slope_window, pos_threshold, neg_threshold):
-        """
-        Single-panel price chart:
-        - Price line
-        - Slope segments (green/gray)
-        - Entry/Exit markers & vertical lines
-        - RSI activation markers
-        - Flag markers
-        """
-        colors = {
-            "price_base": "#e5e7eb",
-            "slope_segment_green": "#10b981",
-            "slope_segment_gray": "#6b7280",
-            "rsi_entry": "#3b82f6",
-            "rsi_exit_green": "#16a34a",
-            "rsi_exit_gray": "#6b7280",
-            "rsi_activation": "#8b5cf6",
-            "flag_activation": "#8b5cf6",
-        }
-
-        df = merged_data.copy().set_index("Date")
-
-        if len(df) > 0:
-            last_date = df.index.max()
-            start_date = last_date - pd.DateOffset(years=5)
-            df = df[df.index >= start_date]
-
-        if df.empty:
-            fig = go.Figure()
-            fig.update_layout(
-                template="plotly_white", title="No data available for the last 5 years"
-            )
-            return fig
-
-        fig = go.Figure()
-
-        # Base price line
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df["Close"],
-                mode="lines",
-                line=dict(color=colors["price_base"], width=2),
-                name="Price",
-                hoverinfo="skip",
-            )
-        )
-
-        # Slope-based segments
-        slope_series = df["Slope"]
-        slope_entry_idx = (slope_series > pos_threshold) & (slope_series.shift(1) <= pos_threshold)
-        slope_exit_idx = (slope_series < neg_threshold) & (slope_series.shift(1) >= neg_threshold)
-
-        slope_entry_dates = slope_series.index[slope_entry_idx].tolist()
-        slope_exit_dates = slope_series.index[slope_exit_idx].tolist()
-
-        slope_trades = []
-        i = j = 0
-        while i < len(slope_entry_dates) and j < len(slope_exit_dates):
-            entry_date = slope_entry_dates[i]
-            while j < len(slope_exit_dates) and slope_exit_dates[j] <= entry_date:
-                j += 1
-            if j < len(slope_exit_dates):
-                exit_date = slope_exit_dates[j]
-                if entry_date in df.index and exit_date in df.index:
-                    entry_price = df.loc[entry_date, "Close"]
-                    exit_price = df.loc[exit_date, "Close"]
-                    slope_return = (exit_price - entry_price) / entry_price * 100
-                    slope_trades.append(
-                        {
-                            "entry_date": entry_date,
-                            "exit_date": exit_date,
-                            "return": slope_return,
-                        }
-                    )
-                j += 1
-            i += 1
-
-        for seg in slope_trades:
-            mask = (df.index >= seg["entry_date"]) & (df.index <= seg["exit_date"])
-            segment_df = df[mask]
-            if len(segment_df) > 1:
-                color = (
-                    colors["slope_segment_green"]
-                    if seg["return"] > 0
-                    else colors["slope_segment_gray"]
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=segment_df.index,
-                        y=segment_df["Close"],
-                        mode="lines",
-                        line=dict(color=color, width=4),
-                        name="Slope Segment",
-                        hoverinfo="skip",
-                        showlegend=False,
-                    )
-                )
-
-        shapes = []
-        if not signals_df.empty:
-            mask_signals = signals_df["Entry_Date"] >= df.index.min()
-            s_df = signals_df[mask_signals].copy()
-
-            if not s_df.empty:
-                for d in s_df["Entry_Date"]:
-                    shapes.append(
-                        dict(
-                            type="line",
-                            x0=d,
-                            x1=d,
-                            y0=0,
-                            y1=1,
-                            xref="x",
-                            yref="paper",
-                            line=dict(
-                                color="rgba(59,130,246,0.40)", width=1.2, dash="dot"
-                            ),
-                        )
-                    )
-                for d in s_df["Exit_Date"]:
-                    shapes.append(
-                        dict(
-                            type="line",
-                            x0=d,
-                            x1=d,
-                            y0=0,
-                            y1=1,
-                            xref="x",
-                            yref="paper",
-                            line=dict(
-                                color="rgba(22,163,74,0.40)", width=1.2, dash="dot"
-                            ),
-                        )
-                    )
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=s_df["Entry_Date"],
-                        y=s_df["Entry_Price"],
-                        mode="markers+text",
-                        marker=dict(
-                            color=colors["rsi_entry"],
-                            size=14,
-                            symbol="triangle-up",
-                            line=dict(color="white", width=1),
-                        ),
-                        text=["ENTRY"] * len(s_df),
-                        textposition="top center",
-                        name="Entry",
-                        hoverinfo="skip",
-                    )
-                )
-
-                exit_colors = [
-                    colors["rsi_exit_green"] if r > 0 else colors["rsi_exit_gray"]
-                    for r in s_df["Return_Pct"]
-                ]
-                fig.add_trace(
-                    go.Scatter(
-                        x=s_df["Exit_Date"],
-                        y=s_df["Exit_Price"],
-                        mode="markers+text",
-                        marker=dict(
-                            color=exit_colors,
-                            size=14,
-                            symbol="triangle-down",
-                            line=dict(color="white", width=1),
-                        ),
-                        text=[f"{r:+.1f}%" for r in s_df["Return_Pct"]],
-                        textposition="bottom center",
-                        name="Exit",
-                        hoverinfo="skip",
-                    )
-                )
-
-        # RSI activation markers
-        if "Active" in df.columns:
-            rsi_points = df[(df["Active"] == 1) & (df["Active"].shift(1) == 0)]
-            if not rsi_points.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=rsi_points.index,
-                        y=rsi_points["Close"],
-                        mode="markers+text",
-                        marker=dict(
-                            color=colors["rsi_activation"],
-                            size=12,
-                            symbol="triangle-up",
-                        ),
-                        text=["RSI"] * len(rsi_points),
-                        textposition="top center",
-                        name="RSI Activation",
-                        hoverinfo="skip",
-                    )
-                )
-
-        # Flag markers
-        if "Flag" in df.columns:
-            flag_points = df[(df["Flag"] == 1) & (df["Flag"].shift(1) == 0)]
-            if not flag_points.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=flag_points.index,
-                        y=flag_points["Close"],
-                        mode="markers+text",
-                        marker=dict(
-                            color=colors["flag_activation"],
-                            size=14,
-                            symbol="diamond",
-                        ),
-                        text=["FLAG"] * len(flag_points),
-                        textposition="middle right",
-                        name="Flag",
-                        hoverinfo="skip",
-                    )
-                )
-
-        last_date = df.index.max()
-        start_date = df.index.min()
-
-        fig.update_layout(
-            shapes=shapes,
-            template="plotly_white",
-            hovermode=False,
-            height=750,
-            margin=dict(l=60, r=40, t=100, b=60),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.06,
-                xanchor="right",
-                x=1,
-                bgcolor="rgba(255,255,255,0.7)",
-                bordercolor="rgba(0,0,0,0.2)",
-                borderwidth=1,
-            ),
-            title=dict(
-                text=f"<b>{branch_name}</b> — Price + Slope Segments + Signals (Last 5 Years Max)",
-                x=0.5,
-                y=0.98,
-                font=dict(size=18),
-            ),
-            xaxis=dict(
-                range=[start_date, last_date],
-                showgrid=True,
-                gridcolor="rgba(0,0,0,0.15)",
-                gridwidth=1,
-                zeroline=False,
-                showline=True,
-                linecolor="rgba(0,0,0,0.40)",
-                linewidth=1.2,
-                rangeselector=dict(
-                    buttons=[
-                        dict(count=7, label="7D", step="day", stepmode="backward"),
-                        dict(count=1, label="1M", step="month", stepmode="backward"),
-                        dict(count=3, label="3M", step="month", stepmode="backward"),
-                        dict(count=6, label="6M", step="month", stepmode="backward"),
-                        dict(count=1, label="1Y", step="year", stepmode="backward"),
-                        dict(count=2, label="2Y", step="year", stepmode="backward"),
-                        dict(count=3, label="3Y", step="year", stepmode="backward"),
-                        dict(count=4, label="4Y", step="year", stepmode="backward"),
-                        dict(count=5, label="5Y", step="year", stepmode="backward"),
-                        dict(step="all", label="ALL"),
-                    ],
-                    bgcolor="rgba(255,255,255,0.9)",
-                    bordercolor="rgba(0,0,0,0.3)",
-                    borderwidth=1,
-                    font=dict(size=12),
-                ),
-                rangeslider=dict(
-                    visible=True,
-                    thickness=0.05,
-                    bgcolor="rgba(230,230,230,0.4)",
-                ),
-                type="date",
-            ),
-            yaxis=dict(
-                title="Price",
-                tickformat="$,.2f",
-                showgrid=True,
-                gridcolor="rgba(0,0,0,0.12)",
-                gridwidth=1.2,
-                zeroline=False,
-                showline=True,
-                linecolor="rgba(0,0,0,0.40)",
-                linewidth=1.2,
-            ),
-        )
-
-        return fig
-
-
+    # ───────────── RSI + Slope Chart ─────────────
     def create_rsi_trigger_price_chart(
         self, ticker_df, branch_df, branch_name, slope_window, pos_threshold, trade_df=None
     ):
@@ -697,7 +450,7 @@ class SlopeTradingAnalyzer:
         - ENTRY/EXIT markers
         - Vertical entry/exit lines
         - Background shading for trades
-        - ENTRY/EXIT labels using annotations (correct way)
+        - ENTRY/EXIT labels using annotations
         """
 
         # --- Parse RSI params ---
@@ -876,27 +629,23 @@ class SlopeTradingAnalyzer:
                     )
                 )
 
-                # -------------------------------------------------------
-                # ENTRY annotation ABOVE the marker
-                # -------------------------------------------------------
+                # ENTRY annotation (slightly below marker)
                 fig.add_annotation(
                     x=entry,
                     y=row["Entry_Price"],
                     text="ENTRY",
                     showarrow=False,
-                    yshift=-24,      # move upward
+                    yshift=-24,
                     font=dict(size=16, color="#000000", family="Arial Black"),
                 )
 
-                # -------------------------------------------------------
-                # EXIT annotation BELOW the marker
-                # -------------------------------------------------------
+                # EXIT annotation (slightly above marker)
                 fig.add_annotation(
                     x=exit_,
                     y=row["Exit_Price"],
                     text=f"{row['Return_Pct']:+.1f}%",
                     showarrow=False,
-                    yshift=26,     # move downward
+                    yshift=26,
                     font=dict(size=16, color="#000000", family="Arial Black"),
                 )
 
@@ -935,156 +684,22 @@ class SlopeTradingAnalyzer:
         )
 
         # Crosshair
-        fig.update_xaxes(showspikes=True, spikethickness=1, spikecolor="#888", spikedash="solid",
-                        spikesnap="cursor", showline=True, linecolor="#ccc")
-        fig.update_yaxes(showspikes=True, spikethickness=1, spikecolor="#888", spikedash="solid",
-                        spikesnap="cursor", showline=True, linecolor="#ccc")
+        fig.update_xaxes(
+            showspikes=True, spikethickness=1, spikecolor="#888", spikedash="solid",
+            spikesnap="cursor", showline=True, linecolor="#ccc"
+        )
+        fig.update_yaxes(
+            showspikes=True, spikethickness=1, spikecolor="#888", spikedash="solid",
+            spikesnap="cursor", showline=True, linecolor="#ccc"
+        )
 
         return fig
-
-
-
-
-
-
-
-
-
-    # ───────────── RSI helpers ─────────────
-    def parse_rsi_from_branch(self, branch_name):
-        """
-        Extract RSI period and threshold from ANY branch name.
-        Examples:
-          - 15D_RSI_A_LT33
-          - 5d_RSI_AAON_LT26
-          - 14D_RSI_ADEA_LT37_and_200D_RSI_ADEA_LT50
-          - 15D_RSI_A_LT33_daily_trade_log
-        Returns: (period, threshold)
-        """
-        base = branch_name.split("_daily_trade_log")[0]
-
-        m = re.search(r"(\d+)[dD]_RSI_[^_]+_(LT|GT)(\d+)", base)
-        if m:
-            period = int(m.group(1))
-            threshold = int(m.group(3))
-            return period, threshold
-
-        parts = base.split("_")
-        rsi_period = None
-        rsi_threshold = None
-
-        for part in parts:
-            if (part.endswith("D") or part.endswith("d")) and part[:-1].isdigit():
-                rsi_period = int(part[:-1])
-
-            if part.startswith("LT") and part[2:].isdigit():
-                rsi_threshold = int(part[2:])
-            if part.startswith("GT") and part[2:].isdigit():
-                rsi_threshold = int(part[2:])
-
-            if rsi_period is not None and rsi_threshold is not None:
-                break
-
-        if rsi_period is None:
-            rsi_period = 14
-        if rsi_threshold is None:
-            rsi_threshold = 30
-
-        return rsi_period, rsi_threshold
-
-    def compute_rsi(self, close_series: pd.Series, period: int):
-        delta = close_series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    def compute_rsi_slope_trades(self, df, rsi_threshold):
-        """
-        Compute trades based on:
-        - RSI trigger
-        - Slope activation window
-        - Entry/exit rules defined by the user
-        """
-
-        trades = []
-        in_position = False
-        waiting_for_slope = False
-        pending_rsi_trigger_date = None
-
-        entry_price = None
-        entry_date = None
-
-        for i in range(1, len(df)):
-            row = df.iloc[i]
-            prev = df.iloc[i - 1]
-
-            rsi_trigger = row["RSI"] < rsi_threshold
-            slope_active = bool(row["SlopeActive"])
-            slope_just_activated = (not prev["SlopeActive"]) and slope_active
-            slope_just_deactivated = prev["SlopeActive"] and (not slope_active)
-
-            # -----------------------------------
-            # 1. RSI TRIGGER OCCURS
-            # -----------------------------------
-            if rsi_trigger:
-                pending_rsi_trigger_date = row["Date"]
-
-                # Case A: RSI triggers during slope-active
-                if slope_active:
-                    entry_price = row["Close"]
-                    entry_date = row["Date"]
-                    in_position = True
-                    waiting_for_slope = False
-                    continue
-
-                # Case B: RSI triggers while slope inactive → wait for next activation
-                waiting_for_slope = True
-
-
-            # -----------------------------------
-            # 2. WAITING FOR SLOPE ACTIVATION? → ENTER
-            # -----------------------------------
-            if waiting_for_slope and slope_just_activated:
-                entry_price = row["Close"]
-                entry_date = row["Date"]
-                in_position = True
-                waiting_for_slope = False
-                continue
-
-            # -----------------------------------
-            # 3. IN POSITION? CHECK EXIT
-            # -----------------------------------
-            if in_position:
-                if slope_just_deactivated:
-                    exit_price = row["Close"]
-                    exit_date = row["Date"]
-
-                    trades.append(
-                        {
-                            "RSI_Trigger_Date": pending_rsi_trigger_date,
-                            "Entry_Date": entry_date,
-                            "Exit_Date": exit_date,
-                            "Entry_Price": entry_price,
-                            "Exit_Price": exit_price,
-                            "Return_Pct": (exit_price - entry_price) / entry_price * 100,
-                            "Days_Held": (exit_date - entry_date).days,
-                        }
-                    )
-
-                    in_position = False
-                    pending_rsi_trigger_date = None
-
-        return pd.DataFrame(trades)
-
 
 
 # ─────────────────────────────
 # Streamlit helpers
 # ─────────────────────────────
+
 @st.cache_resource
 def init_analyzer():
     return SlopeTradingAnalyzer()
@@ -1170,9 +785,10 @@ def display_yearly_cards(yearly_dict):
 # ─────────────────────────────
 # Main App
 # ─────────────────────────────
+
 def main():
     st.title("Slope Trading Analyzer")
-    st.markdown("### Advanced RSI + Slope Filter Backtesting System")
+    st.markdown("### Advanced RSI + Slope Filter Backtesting System (Unified Strategy)")
 
     analyzer = init_analyzer()
 
@@ -1183,7 +799,6 @@ def main():
         st.subheader("Slope Parameters")
         slope_window = st.slider("Slope Length (days)", 5, 30, 15)
         pos_threshold = st.slider("Positive Threshold (%)", 0.0, 20.0, 5.0, 0.5)
-        neg_threshold = st.slider("Negative Threshold (%)", -10.0, 10.0, 0.0, 0.5)
 
         st.divider()
 
@@ -1209,7 +824,7 @@ def main():
     all_branches = available_branches
 
     # Params snapshot for overall caching
-    current_params = (slope_window, pos_threshold, neg_threshold)
+    current_params = (slope_window, pos_threshold)
 
     tab_individual, tab_overall, tab_reports = st.tabs(
         ["Individual Analysis", "Overall Results", "Detailed Reports"]
@@ -1225,20 +840,25 @@ def main():
                 ticker_data = analyzer.load_ticker_data(ticker)
 
                 if ticker_data is not None:
-                    merged_data, signals_df = analyzer.apply_slope_filter(
-                        branch_data,
-                        ticker_data,
-                        slope_window,
-                        pos_threshold,
-                        neg_threshold,
-                    )
+                    # Build DF with RSI + slope + SlopeActive
+                    df = ticker_data.copy()
+                    df = df.merge(branch_data[["Date", "Active"]], on="Date", how="left")
+                    df["Active"] = df["Active"].fillna(0)
 
-                    metrics = analyzer.calculate_performance_metrics(signals_df)
+                    rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(branch_to_analyze)
+                    df["RSI"] = analyzer.compute_rsi(df["Close"], rsi_period)
+                    df["Slope"] = analyzer.calculate_slope(df["Close"], slope_window)
+                    df["SlopeActive"] = df["Slope"] > pos_threshold
+
+                    # Trades from unified RSI + Slope strategy
+                    trade_df = analyzer.compute_rsi_slope_trades(df, rsi_threshold)
+
+                    metrics = analyzer.calculate_performance_metrics(trade_df)
 
                     st.subheader(f"Performance Metrics - {branch_pretty}")
                     display_performance_metrics(metrics)
 
-                    yearly = analyzer.compute_yearly_stats(signals_df)
+                    yearly = analyzer.compute_yearly_stats(trade_df)
                     if show_yearly:
                         st.subheader("Yearly Performance Breakdown")
                         display_yearly_cards(yearly)
@@ -1246,38 +866,11 @@ def main():
                     st.divider()
 
                     if show_individual_charts:
-                        # st.subheader(
-                        #     "Price Chart with Slope Segments & Signals (Last 5 Years Max)"
-                        # )
-                        # chart = analyzer.create_price_chart(
-                        #     merged_data,
-                        #     signals_df,
-                        #     branch_to_analyze,
-                        #     slope_window,
-                        #     pos_threshold,
-                        #     neg_threshold,
-                        # )
-                        # st.plotly_chart(chart, use_container_width=True)
-
-                        st.subheader("RSI Trigger Price Chart (Gray Candles)")
-                        rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(
-                            branch_to_analyze
-                        )
+                        st.subheader("RSI Trigger + Slope Price Chart with Trades")
                         st.caption(
-                            f"Debug RSI: period={rsi_period}, threshold={rsi_threshold}, branch={branch_to_analyze}"
+                            f"Strategy: RSI < {rsi_threshold} + SlopeActive > {pos_threshold}%, "
+                            f"period={rsi_period}D, slope window={slope_window}D"
                         )
-                        
-                        df = ticker_data.copy()
-                        df = df.merge(branch_data[["Date", "Active"]], on="Date", how="left")
-                        df["Active"] = df["Active"].fillna(0)
-
-                        rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(branch_to_analyze)
-                        df["RSI"] = analyzer.compute_rsi(df["Close"], rsi_period)
-
-                        df["Slope"] = analyzer.calculate_slope(df["Close"], slope_window)
-                        df["SlopeActive"] = df["Slope"] > pos_threshold
-
-                        trade_df = analyzer.compute_rsi_slope_trades(df, rsi_threshold)
 
                         rsi_chart = analyzer.create_rsi_trigger_price_chart(
                             ticker_data,
@@ -1285,15 +878,17 @@ def main():
                             branch_to_analyze,
                             slope_window=slope_window,
                             pos_threshold=pos_threshold,
-                            trade_df=trade_df       # <-- REQUIRED for entries & exits
+                            trade_df=trade_df,
                         )
 
                         st.plotly_chart(rsi_chart, use_container_width=True)
 
-
-                    if not signals_df.empty:
-                        st.subheader("Trade Details")
-                        trade_display = signals_df.copy()
+                    if trade_df is not None and not trade_df.empty:
+                        st.subheader("Trade Details (RSI + Slope Strategy)")
+                        trade_display = trade_df.copy()
+                        trade_display["RSI_Trigger_Date"] = trade_display[
+                            "RSI_Trigger_Date"
+                        ].dt.strftime("%Y-%m-%d")
                         trade_display["Entry_Date"] = trade_display[
                             "Entry_Date"
                         ].dt.strftime("%Y-%m-%d")
@@ -1302,10 +897,12 @@ def main():
                         ].dt.strftime("%Y-%m-%d")
                         trade_display = trade_display.round(2)
                         st.dataframe(trade_display, use_container_width=True)
+                    else:
+                        st.info("No trades generated for this branch under current parameters.")
 
     # ───────── Overall Results ─────────
     with tab_overall:
-        st.header("Overall Performance Summary (All Branches)")
+        st.header("Overall Performance Summary (All Branches, Unified RSI+Slope Strategy)")
 
         # Button-based recompute to avoid heavy loop on every interaction
         run_overall = st.button("Run / Recompute Overall Analysis")
@@ -1334,15 +931,18 @@ def main():
                 if ticker_data is None:
                     continue
 
-                merged_data, signals_df = analyzer.apply_slope_filter(
-                    branch_data,
-                    ticker_data,
-                    slope_window,
-                    pos_threshold,
-                    neg_threshold,
-                )
+                df = ticker_data.copy()
+                df = df.merge(branch_data[["Date", "Active"]], on="Date", how="left")
+                df["Active"] = df["Active"].fillna(0)
 
-                metrics = analyzer.calculate_performance_metrics(signals_df)
+                rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(branch)
+                df["RSI"] = analyzer.compute_rsi(df["Close"], rsi_period)
+                df["Slope"] = analyzer.calculate_slope(df["Close"], slope_window)
+                df["SlopeActive"] = df["Slope"] > pos_threshold
+
+                trade_df = analyzer.compute_rsi_slope_trades(df, rsi_threshold)
+
+                metrics = analyzer.calculate_performance_metrics(trade_df)
                 metrics["Branch"] = branch
                 metrics["Ticker"] = ticker
                 all_results.append(metrics)
@@ -1392,7 +992,7 @@ def main():
                     x="Win_Rate_Pct",
                     y="Total_Return_Pct",
                     hover_data=["Branch", "Num_Trades"],
-                    title="Return vs Win Rate",
+                    title="Return vs Win Rate (RSI+Slope Strategy)",
                     labels={
                         "Win_Rate_Pct": "Win Rate (%)",
                         "Total_Return_Pct": "Total Return (%)",
@@ -1404,7 +1004,7 @@ def main():
                 fig_hist = px.histogram(
                     results_df,
                     x="Total_Return_Pct",
-                    title="Return Distribution",
+                    title="Return Distribution (All Branches)",
                     labels={"Total_Return_Pct": "Total Return (%)"},
                 )
                 st.plotly_chart(fig_hist, use_container_width=True)
@@ -1430,10 +1030,11 @@ def main():
 
             if show_yearly:
                 st.subheader(
-                    "Yearly Performance Breakdown (Note: per-branch yearly stats shown in Individual Analysis)"
+                    "Yearly Performance Breakdown Note"
                 )
                 st.info(
-                    "Global yearly aggregation across all branches can be added here if needed."
+                    "Yearly stats per branch are shown in the Individual Analysis tab. "
+                    "Global yearly aggregation could be added here if needed."
                 )
 
             st.subheader("Current Parameters Summary")
@@ -1442,12 +1043,10 @@ def main():
                     "Parameter": [
                         "Slope Window",
                         "Positive Threshold",
-                        "Negative Threshold",
                     ],
                     "Value": [
                         f"{slope_window} days",
                         f"{pos_threshold}%",
-                        f"{neg_threshold}%",
                     ],
                 }
             )
