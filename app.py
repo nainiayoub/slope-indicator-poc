@@ -685,38 +685,52 @@ class SlopeTradingAnalyzer:
 
         return fig
 
-    # ───────────── RSI trigger price chart (dynamic) ─────────────
-    def create_rsi_trigger_price_chart(self, ticker_df, branch_df, branch_name):
+
+    def create_rsi_trigger_price_chart(
+        self, ticker_df, branch_df, branch_name, slope_window, pos_threshold, trade_df=None
+    ):
         """
-        Fully TradingView-like price chart for RSI triggers.
-        Clean candles, volume bars, hover crosshair, TV-style period selectors.
+        RSI Trigger + Slope Activation Hybrid Chart
+        - Candlesticks
+        - Slope line (green = active, gray = inactive)
+        - RSI triggers
+        - ENTRY/EXIT markers
+        - Vertical entry/exit lines
+        - Background shading for trades
+        - ENTRY/EXIT labels using annotations (correct way)
         """
+
+        # --- Parse RSI params ---
         rsi_period, rsi_threshold = self.parse_rsi_from_branch(branch_name)
 
+        # --- Prepare DF ---
         df = ticker_df.copy()
         df = df.merge(branch_df[["Date", "Active"]], on="Date", how="left")
         df["Active"] = df["Active"].fillna(0)
+        df = df.sort_values("Date").reset_index(drop=True)
+
+        # Compute RSI
         df["RSI"] = self.compute_rsi(df["Close"], rsi_period)
 
-        # Time filter (last 1 year)
-        max_date = df["Date"].max()
-        df = df[df["Date"] >= max_date - pd.DateOffset(years=1)]
+        # Compute slope
+        df["Slope"] = self.calculate_slope(df["Close"], slope_window)
+        df["SlopeActive"] = df["Slope"] > pos_threshold
 
-        # TradingView candle colors
+        # Colors
+        slope_green = "#10b981"
+        slope_gray = "#9e9e9e"
         bull = "#26a69a"
         bear = "#ef5350"
 
-        df["Volume_Color"] = [
-            bull if df["Close"].iloc[i] >= df["Open"].iloc[i] else bear
-            for i in range(len(df))
-        ]
-
+        # RSI triggers
         oversold = df[df["RSI"] < rsi_threshold]
 
-        # Figure
+        # -------------------------------------------------------
+        #   FIGURE
+        # -------------------------------------------------------
         fig = go.Figure()
 
-        # Candles
+        # === BASE CANDLESTICKS ===
         fig.add_trace(
             go.Candlestick(
                 x=df["Date"],
@@ -732,102 +746,207 @@ class SlopeTradingAnalyzer:
             )
         )
 
-        # Volume bars
-        fig.add_trace(
-            go.Bar(
-                x=df["Date"],
-                y=df["Volume"],
-                marker_color=df["Volume_Color"],
-                opacity=0.35,
-                name="Volume",
-                yaxis="y2",
-            )
-        )
+        # ===============================================================
+        #   SLOPE LINE OVERLAY
+        # ===============================================================
+        for i in range(len(df) - 1):
+            seg_color = slope_green if df["SlopeActive"].iloc[i] else slope_gray
 
-        # RSI trigger markers
+            fig.add_trace(
+                go.Scatter(
+                    x=[df["Date"].iloc[i], df["Date"].iloc[i+1]],
+                    y=[df["Close"].iloc[i], df["Close"].iloc[i+1]],
+                    mode="lines",
+                    line=dict(color=seg_color, width=3.5),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+        # === RSI Trigger Points ===
         fig.add_trace(
             go.Scatter(
                 x=oversold["Date"],
                 y=oversold["Close"],
                 mode="markers",
-                name=f"RSI < {rsi_threshold}",
                 marker=dict(
                     color="#1e88e5",
                     size=12,
                     symbol="triangle-up",
                     line=dict(color="white", width=1),
                 ),
+                name=f"RSI < {rsi_threshold}",
             )
         )
 
-        # Layout (TradingView style)
+        # ===============================================================
+        #   ENTRY / EXIT PLOTTING (MARKERS + SHADING + VERTICAL LINES)
+        # ===============================================================
+        shapes = []
+
+        if trade_df is not None and len(trade_df) > 0:
+
+            # --- ENTRY markers ---
+            fig.add_trace(
+                go.Scatter(
+                    x=trade_df["Entry_Date"],
+                    y=trade_df["Entry_Price"],
+                    mode="markers",
+                    marker=dict(
+                        color="#10b981",
+                        size=18,
+                        symbol="triangle-up",
+                        line=dict(color="white", width=1),
+                    ),
+                    name="Entry",
+                )
+            )
+
+            # --- EXIT markers ---
+            fig.add_trace(
+                go.Scatter(
+                    x=trade_df["Exit_Date"],
+                    y=trade_df["Exit_Price"],
+                    mode="markers",
+                    marker=dict(
+                        color="#ef4444",
+                        size=18,
+                        symbol="triangle-down",
+                        line=dict(color="white", width=1),
+                    ),
+                    name="Exit",
+                )
+            )
+
+            # --- Trade shading, vertical lines, and annotations ---
+            for _, row in trade_df.iterrows():
+
+                entry = row["Entry_Date"]
+                exit_ = row["Exit_Date"]
+
+                # 🔶 Background shading
+                shapes.append(
+                    dict(
+                        type="rect",
+                        xref="x",
+                        yref="paper",
+                        x0=entry,
+                        x1=exit_,
+                        y0=0,
+                        y1=1,
+                        fillcolor="rgba(16,185,129,0.08)",
+                        line=dict(width=0),
+                        layer="below",
+                    )
+                )
+
+                # 🔹 ENTRY vertical line
+                shapes.append(
+                    dict(
+                        type="line",
+                        x0=entry,
+                        x1=entry,
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="paper",
+                        line=dict(
+                            color="rgba(16,185,129,0.35)",
+                            width=1.3,
+                            dash="dot",
+                        ),
+                    )
+                )
+
+                # 🔺 EXIT vertical line
+                shapes.append(
+                    dict(
+                        type="line",
+                        x0=exit_,
+                        x1=exit_,
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="paper",
+                        line=dict(
+                            color="rgba(239,68,68,0.35)",
+                            width=1.3,
+                            dash="dot",
+                        ),
+                    )
+                )
+
+                # -------------------------------------------------------
+                # ENTRY annotation ABOVE the marker
+                # -------------------------------------------------------
+                fig.add_annotation(
+                    x=entry,
+                    y=row["Entry_Price"],
+                    text="ENTRY",
+                    showarrow=False,
+                    yshift=-24,      # move upward
+                    font=dict(size=16, color="#000000", family="Arial Black"),
+                )
+
+                # -------------------------------------------------------
+                # EXIT annotation BELOW the marker
+                # -------------------------------------------------------
+                fig.add_annotation(
+                    x=exit_,
+                    y=row["Exit_Price"],
+                    text=f"{row['Return_Pct']:+.1f}%",
+                    showarrow=False,
+                    yshift=26,     # move downward
+                    font=dict(size=16, color="#000000", family="Arial Black"),
+                )
+
+        # Apply shapes
+        fig.update_layout(shapes=shapes)
+
+        # -------------------------------------------------------
+        # Default view = last 1 year
+        # -------------------------------------------------------
+        max_date = df["Date"].max()
+        min_date = df["Date"].min()
+        default_start = max_date - pd.DateOffset(years=1)
+        default_start = max(default_start, min_date)
+
         fig.update_layout(
             title=dict(
-                text=f"<b>{branch_name}</b> — RSI Trigger Chart",
+                text=f"<b>{branch_name}</b> — RSI Trigger + Slope Trend + Trades",
                 x=0.5,
                 font=dict(size=20),
             ),
             height=750,
-            margin=dict(l=60, r=40, t=60, b=40),
+            margin=dict(l=50, r=40, t=60, b=40),
+            hovermode="x unified",
             plot_bgcolor="white",
             paper_bgcolor="white",
-            hovermode="x unified",
-            showlegend=False,
             xaxis=dict(
                 type="date",
+                range=[default_start, max_date],
                 rangeslider=dict(visible=False),
-                showgrid=False,
-                rangeselector=dict(
-                    buttons=[
-                        dict(count=7, label="7D", step="day", stepmode="backward"),
-                        dict(count=1, label="1M", step="month", stepmode="backward"),
-                        dict(count=3, label="3M", step="month", stepmode="backward"),
-                        dict(count=6, label="6M", step="month", stepmode="backward"),
-                        dict(step="year", stepmode="todate", label="YTD"),   # TradingView-style YTD
-                        dict(count=1, label="1Y", step="year", stepmode="backward"),
-                        dict(step="all", label="ALL"),
-                    ],
-                    bgcolor="rgba(255,255,255,0.8)",
-                    borderwidth=1,
-                    bordercolor="rgba(200,200,200,0.4)",
-                ),
             ),
             yaxis=dict(
                 title="Price",
                 showgrid=True,
                 gridcolor="rgba(200,200,200,0.25)",
-                zeroline=False,
-            ),
-            yaxis2=dict(
-                overlaying="y",
-                side="right",
-                showgrid=False,
-                visible=False,
-                range=[0, df["Volume"].max() * 5],
             ),
         )
 
         # Crosshair
-        fig.update_xaxes(
-            showspikes=True,
-            spikethickness=1,
-            spikecolor="#888",
-            spikedash="solid",
-            spikesnap="cursor",
-            showline=True,
-            linecolor="#ccc",
-        )
-        fig.update_yaxes(
-            showspikes=True,
-            spikethickness=1,
-            spikecolor="#888",
-            spikedash="solid",
-            spikesnap="cursor",
-            showline=True,
-            linecolor="#ccc",
-        )
+        fig.update_xaxes(showspikes=True, spikethickness=1, spikecolor="#888", spikedash="solid",
+                        spikesnap="cursor", showline=True, linecolor="#ccc")
+        fig.update_yaxes(showspikes=True, spikethickness=1, spikecolor="#888", spikedash="solid",
+                        spikesnap="cursor", showline=True, linecolor="#ccc")
 
         return fig
+
+
+
+
+
+
 
 
 
@@ -882,6 +1001,85 @@ class SlopeTradingAnalyzer:
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         return rsi
+
+    def compute_rsi_slope_trades(self, df, rsi_threshold):
+        """
+        Compute trades based on:
+        - RSI trigger
+        - Slope activation window
+        - Entry/exit rules defined by the user
+        """
+
+        trades = []
+        in_position = False
+        waiting_for_slope = False
+        pending_rsi_trigger_date = None
+
+        entry_price = None
+        entry_date = None
+
+        for i in range(1, len(df)):
+            row = df.iloc[i]
+            prev = df.iloc[i - 1]
+
+            rsi_trigger = row["RSI"] < rsi_threshold
+            slope_active = bool(row["SlopeActive"])
+            slope_just_activated = (not prev["SlopeActive"]) and slope_active
+            slope_just_deactivated = prev["SlopeActive"] and (not slope_active)
+
+            # -----------------------------------
+            # 1. RSI TRIGGER OCCURS
+            # -----------------------------------
+            if rsi_trigger:
+                pending_rsi_trigger_date = row["Date"]
+
+                # Case A: RSI triggers during slope-active
+                if slope_active:
+                    entry_price = row["Close"]
+                    entry_date = row["Date"]
+                    in_position = True
+                    waiting_for_slope = False
+                    continue
+
+                # Case B: RSI triggers while slope inactive → wait for next activation
+                waiting_for_slope = True
+
+
+            # -----------------------------------
+            # 2. WAITING FOR SLOPE ACTIVATION? → ENTER
+            # -----------------------------------
+            if waiting_for_slope and slope_just_activated:
+                entry_price = row["Close"]
+                entry_date = row["Date"]
+                in_position = True
+                waiting_for_slope = False
+                continue
+
+            # -----------------------------------
+            # 3. IN POSITION? CHECK EXIT
+            # -----------------------------------
+            if in_position:
+                if slope_just_deactivated:
+                    exit_price = row["Close"]
+                    exit_date = row["Date"]
+
+                    trades.append(
+                        {
+                            "RSI_Trigger_Date": pending_rsi_trigger_date,
+                            "Entry_Date": entry_date,
+                            "Exit_Date": exit_date,
+                            "Entry_Price": entry_price,
+                            "Exit_Price": exit_price,
+                            "Return_Pct": (exit_price - entry_price) / entry_price * 100,
+                            "Days_Held": (exit_date - entry_date).days,
+                        }
+                    )
+
+                    in_position = False
+                    pending_rsi_trigger_date = None
+
+        return pd.DataFrame(trades)
+
 
 
 # ─────────────────────────────
@@ -1048,18 +1246,18 @@ def main():
                     st.divider()
 
                     if show_individual_charts:
-                        st.subheader(
-                            "Price Chart with Slope Segments & Signals (Last 5 Years Max)"
-                        )
-                        chart = analyzer.create_price_chart(
-                            merged_data,
-                            signals_df,
-                            branch_to_analyze,
-                            slope_window,
-                            pos_threshold,
-                            neg_threshold,
-                        )
-                        st.plotly_chart(chart, use_container_width=True)
+                        # st.subheader(
+                        #     "Price Chart with Slope Segments & Signals (Last 5 Years Max)"
+                        # )
+                        # chart = analyzer.create_price_chart(
+                        #     merged_data,
+                        #     signals_df,
+                        #     branch_to_analyze,
+                        #     slope_window,
+                        #     pos_threshold,
+                        #     neg_threshold,
+                        # )
+                        # st.plotly_chart(chart, use_container_width=True)
 
                         st.subheader("RSI Trigger Price Chart (Gray Candles)")
                         rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(
@@ -1068,10 +1266,30 @@ def main():
                         st.caption(
                             f"Debug RSI: period={rsi_period}, threshold={rsi_threshold}, branch={branch_to_analyze}"
                         )
+                        
+                        df = ticker_data.copy()
+                        df = df.merge(branch_data[["Date", "Active"]], on="Date", how="left")
+                        df["Active"] = df["Active"].fillna(0)
+
+                        rsi_period, rsi_threshold = analyzer.parse_rsi_from_branch(branch_to_analyze)
+                        df["RSI"] = analyzer.compute_rsi(df["Close"], rsi_period)
+
+                        df["Slope"] = analyzer.calculate_slope(df["Close"], slope_window)
+                        df["SlopeActive"] = df["Slope"] > pos_threshold
+
+                        trade_df = analyzer.compute_rsi_slope_trades(df, rsi_threshold)
+
                         rsi_chart = analyzer.create_rsi_trigger_price_chart(
-                            ticker_data, branch_data, branch_to_analyze
+                            ticker_data,
+                            branch_data,
+                            branch_to_analyze,
+                            slope_window=slope_window,
+                            pos_threshold=pos_threshold,
+                            trade_df=trade_df       # <-- REQUIRED for entries & exits
                         )
+
                         st.plotly_chart(rsi_chart, use_container_width=True)
+
 
                     if not signals_df.empty:
                         st.subheader("Trade Details")
