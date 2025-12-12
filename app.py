@@ -881,7 +881,7 @@ def main():
                             trade_df=trade_df,
                         )
 
-                        st.plotly_chart(rsi_chart, width=True)
+                        st.plotly_chart(rsi_chart, use_container_width=True)
 
                     if trade_df is not None and not trade_df.empty:
                         st.subheader("Trade Details (RSI + Slope Strategy)")
@@ -896,7 +896,7 @@ def main():
                             "Exit_Date"
                         ].dt.strftime("%Y-%m-%d")
                         trade_display = trade_display.round(2)
-                        st.dataframe(trade_display, width=True)
+                        st.dataframe(trade_display, use_container_width=True)
                     else:
                         st.info("No trades generated for this branch under current parameters.")
 
@@ -981,7 +981,7 @@ def main():
 
             st.subheader("Branch Performance Comparison")
             display_df = results_df.copy().round(2)
-            st.dataframe(display_df, width=True)
+            st.dataframe(display_df, use_container_width=True)
 
             st.subheader("Performance Visualization")
             col1, col2 = st.columns(2)
@@ -998,7 +998,7 @@ def main():
                         "Total_Return_Pct": "Total Return (%)",
                     },
                 )
-                st.plotly_chart(fig_scatter, width=True)
+                st.plotly_chart(fig_scatter, use_container_width=True)
 
             with col2:
                 fig_hist = px.histogram(
@@ -1007,7 +1007,7 @@ def main():
                     title="Return Distribution (All Branches)",
                     labels={"Total_Return_Pct": "Total Return (%)"},
                 )
-                st.plotly_chart(fig_hist, width=True)
+                st.plotly_chart(fig_hist, use_container_width=True)
         else:
             st.info("Click the button above to run the overall analysis.")
 
